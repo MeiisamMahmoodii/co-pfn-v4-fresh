@@ -133,8 +133,8 @@ def train():
             for b in range(batch_size_actual):
                 k = n_claims[b].item()
                 if k > 0:
-                    # Mean trust for this sample
-                    mean_trust_b = trust_pred[b, :k, 0].mean()
+                    # Mean trust for this sample - DETACHED to prevent model lowering trust to dodge ATE penalties
+                    mean_trust_b = trust_pred[b, :k, 0].detach().mean()
                     # Weight: 1 + alpha * mean_trust, clamped to [1.0, 1.5]
                     weight = (1.0 + alpha_trust_weight * mean_trust_b).clamp(1.0, 1.5)
                     ate_weights.append(weight)

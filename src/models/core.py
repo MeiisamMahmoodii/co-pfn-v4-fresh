@@ -51,8 +51,13 @@ class TheoryFirstTransformer(nn.Module):
         self.cross_attn = nn.MultiheadAttention(embed_dim, n_heads, batch_first=True, dropout=0.1)
         self.norm_cross = nn.LayerNorm(embed_dim)
 
-        # 4. Correction Head
-        self.correction_head = nn.Linear(embed_dim, 1)
+        # 4. Correction Head - Strengthened with MLP
+        # Stronger capacity to move ATE when trusted claims provide evidence
+        self.correction_head = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim // 2),
+            nn.GELU(),
+            nn.Linear(embed_dim // 2, 1)
+        )
         
         # 5. Learnable trust amplification scale
         self.trust_scale = nn.Parameter(torch.tensor(2.0))
