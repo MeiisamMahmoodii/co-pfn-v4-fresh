@@ -63,18 +63,20 @@ def train():
     # 1. Hyperparameters
     max_vars = 20
     max_samples = 1000
-    batch_size = 64
+    batch_size = 16
     lr = 1e-4
     n_epochs = 100
     steps_per_epoch = 100
     lambda_ate = 1.0
     lambda_trust = 5.0  # BCE loss weight
     lambda_pairwise = 3.0  # Pairwise ranking loss weight - reduced to prevent trust equalization
+    alpha_trust_weight = 0.5  # Trust-weighted ATE loss: weight = 1 + alpha * mean_trust
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"--- ADVERSARIAL TRAINING WITH PAIRWISE RANKING ---")
+    print(f"--- ADVERSARIAL TRAINING WITH PAIRWISE RANKING + TRUST-WEIGHTED ATE ---")
     print(f"Device: {device} | Max Epochs: {n_epochs}")
     print(f"Weights: ATE={lambda_ate}, Trust={lambda_trust}, Pairwise={lambda_pairwise}")
+    print(f"Trust-Weighted ATE: alpha={alpha_trust_weight}, weight range [1.0, 1.5]")
 
     # 2. Data & Model
     dataset = CausalPFNDataset(
@@ -121,18 +123,44 @@ def train():
             
             ate_pred, trust_pred = model(data, claims, n_claims=n_claims, n_samples=n_samples)
             
-            loss_ate = criterion_ate(ate_pred, ate_truth)
             loss_trust = criterion_trust(trust_pred, validity_truth)
             loss_pairwise = pairwise_ranking_loss(trust_pred, validity_truth, n_claims, margin=0.3)
             
-            loss = lambda_ate * loss_ate + lambda_trust * loss_trust + lambda_pairwise * loss_pairwise
+            # Trust-weighted ATE loss: force ATE to improve when claiming high trust
+            # Compute mean trust per sample (over valid claims only)
+            batch_size_actual = trust_pred.shape[0]
+            ate_weights = []
+            for b in range(batch_size_actual):
+                k = n_claims[b].item()
+                if k > 0:
+                    # Mean trust for this sample
+                    mean_trust_b = trust_pred[b, :k, 0].mean()
+                    # Weight: 1 + alpha * mean_trust, clamped to [1.0, 1.5]
+                    weight = (1.0 + alpha_trust_weight * mean_trust_b).clamp(1.0, 1.5)
+                    ate_weights.append(weight)
+                else:
+                    ate_weights.append(torch.tensor(1.0, device=device))
+            
+            ate_weights = torch.stack(ate_weights)  # [B]
+            
+            # Compute per-sample ATE loss using Huber loss
+            ate_residual = torch.abs(ate_pred.squeeze(-1) - ate_truth)
+            huber_threshold = 1.0
+            ate_loss_per_sample = torch.where(
+                ate_residual <= huber_threshold,
+                0.5 * ate_residual ** 2,
+                huber_threshold * (ate_residual - 0.5 * huber_threshold)
+            )
+            loss_ate_weighted = (ate_loss_per_sample * ate_weights).mean()
+            
+            loss = lambda_ate * loss_ate_weighted + lambda_trust * loss_trust + lambda_pairwise * loss_pairwise
             
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             
             epoch_loss += loss.item()
-            epoch_ate_loss += loss_ate.item()
+            epoch_ate_loss += loss_ate_weighted.item()
             epoch_trust_loss += loss_trust.item()
             epoch_pair_loss += loss_pairwise.item()
         
