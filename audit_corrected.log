@@ -1,0 +1,16 @@
+/home/meisam/code/co-pfn-v4/.venv/lib/python3.12/site-packages/torch/nn/modules/transformer.py:531: UserWarning: The PyTorch API of nested tensors is in prototype stage and will change in the near future. We recommend specifying layout=torch.jagged when constructing a nested tensor, as this layout receives active development, has better operator coverage, and works with torch.compile. (Triggered internally at /pytorch/aten/src/ATen/NestedTensorImpl.cpp:178.)
+  output = torch._nested_tensor_from_mask(
+--- LALONDE REAL-WORLD AUDIT ---
+
+Evaluating: Adjustment (re74, re75, age, educ)
+  Trust Score: 0.0002
+  Estimated ATE: 0.0018
+
+Evaluating: Reverse Causality (re78 -> treat)
+  Trust Score: 0.0002
+  Estimated ATE: 0.0018
+
+Evaluating: False IV (age -> treat)
+  Trust Score: 0.0002
+  Estimated ATE: 0.0018
+Audit report written to results/audit_report.md
