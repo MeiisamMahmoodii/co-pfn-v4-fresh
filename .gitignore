@@ -1,1 +1,7 @@
-*.pt
+# Ignore only Python cache and temporary files
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.DS_Store
