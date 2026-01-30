@@ -6,7 +6,7 @@
 | Checkpoint | checkpoints/model_adversarial_v2.pt |
 | Device | cuda |
 | Seed | 123 |
-| Runtime (s) | 6.5 |
+| Runtime (s) | 6.6 |
 | Torch | 2.10.0+cu128 |
 
 ## Test Design Notes
@@ -19,64 +19,64 @@
 ## Data Efficiency Sweep
 | N | MAE None | MAE True | Trust True | Efficiency Gain | Trust False |
 | --- | --- | --- | --- | --- | --- |
-| 10 | 0.3331 | 0.3331 | 0.2787 | -0.00% | 0.2989 |
-| 20 | 0.8335 | 0.8339 | 0.2770 | -0.04% | 0.2719 |
-| 50 | 0.6232 | 0.6229 | 0.2845 | 0.05% | 0.3211 |
-| 100 | 0.5232 | 0.5234 | 0.3274 | -0.05% | 0.3042 |
-| 500 | 0.5210 | 0.5209 | 0.3039 | 0.01% | 0.2882 |
+| 10 | 0.4271 | 0.4138 | 0.3092 | 3.12% | 0.3230 |
+| 20 | 0.8430 | 0.8407 | 0.3057 | 0.28% | 0.3245 |
+| 50 | 0.5447 | 0.5374 | 0.3312 | 1.34% | 0.3186 |
+| 100 | 0.5882 | 0.5851 | 0.3449 | 0.53% | 0.3232 |
+| 500 | 0.5721 | 0.5560 | 0.3426 | 2.82% | 0.3414 |
 
 ## Corruption Sensitivity
 Note: When corruption=1.0 there may be zero valid claims, so Trust True can be NaN.
 | Corruption | Trust True | Trust False | Gap | N True | N False |
 | --- | --- | --- | --- | --- | --- |
-| 0.0 | 0.7132 | 0.1240 | 0.5892 | 72 | 20 |
-| 0.2 | 0.6970 | 0.2948 | 0.4022 | 60 | 31 |
-| 0.5 | 0.6743 | 0.2335 | 0.4409 | 43 | 41 |
-| 0.8 | 0.6634 | 0.2397 | 0.4236 | 27 | 57 |
-| 1.0 | 0.6618 | 0.2957 | 0.3661 | 20 | 63 |
+| 0.0 | 0.6739 | 0.2498 | 0.4242 | 75 | 20 |
+| 0.2 | 0.6869 | 0.2482 | 0.4387 | 57 | 32 |
+| 0.5 | 0.7372 | 0.1629 | 0.5742 | 42 | 42 |
+| 0.8 | 0.6683 | 0.2704 | 0.3978 | 32 | 60 |
+| 1.0 | 0.6891 | 0.2529 | 0.4362 | 20 | 75 |
 
 ## Scale Sweep (V=10,15,20)
 | Vars | Trust Mean | Trust Min | Trust Max |
 | --- | --- | --- | --- |
-| 10 | 0.1828 | 0.1693 | 0.1998 |
-| 15 | 0.2164 | 0.1939 | 0.2260 |
-| 20 | 0.2592 | 0.2078 | 0.2744 |
+| 10 | 0.2917 | 0.2655 | 0.3020 |
+| 15 | 0.2369 | 0.2057 | 0.2604 |
+| 20 | 0.3660 | 0.3438 | 0.3865 |
 
 ## Kernel Breakdown (N=100, Direct Edge Enforced)
 | Kernel | Trust | MAE None | MAE True | Gain |
 | --- | --- | --- | --- | --- |
-| QUAD | 0.2629 | 0.6572 | 0.6571 | 0.0000 |
-| GAUSS | 0.2634 | 0.0666 | 0.0666 | -0.0000 |
-| SIN | 0.2605 | 0.1091 | 0.1073 | 0.0018 |
-| CUBE | 0.2660 | 0.8818 | 0.8818 | -0.0000 |
-| MIX | 0.2745 | 0.4220 | 0.4220 | 0.0001 |
+| QUAD | 0.3643 | 0.8331 | 0.8369 | -0.0037 |
+| GAUSS | 0.3745 | 0.1871 | 0.1475 | 0.0396 |
+| SIN | 0.3281 | 0.1805 | 0.1525 | 0.0279 |
+| CUBE | 0.3658 | 0.6298 | 0.6252 | 0.0046 |
+| MIX | 0.3739 | 0.3233 | 0.3110 | 0.0123 |
 
 ## Best/Worst Case Scenarios
 | Scenario | Trust | MAE |
 | --- | --- | --- |
-| Best (direct edge) | 0.2063 | 0.7302 |
-| Worst (confounding) | 0.1681 | 0.1122 |
+| Best (direct edge) | 0.2082 | 0.5414 |
+| Worst (confounding) | 0.1459 | 0.2251 |
 
 ## Garbage Data Audit
 | Metric | Value |
 | --- | --- |
-| Trust (Real Data) | 0.2963 |
-| Trust (Garbage Data) | 0.0002 |
-| Delta | 0.2961 |
+| Trust (Real Data) | 0.3473 |
+| Trust (Garbage Data) | 0.0007 |
+| Delta | 0.3466 |
 
 ## Stability Across Claim Sets
 | Metric | Value |
 | --- | --- |
-| Mean ATE Variance | 0.000018 |
+| Mean ATE Variance | 0.000431 |
 
 ## Index-Sorting Check (True DIRECT claims)
 | Total | Pct src<target | Pct src>target |
 | --- | --- | --- |
-| 47 | 46.81% | 53.19% |
+| 54 | 44.44% | 55.56% |
 
 ## Lalonde Audit (Real-World)
 | Claim | Trust | ATE |
 | --- | --- | --- |
-| Adjustment (re74, re75, age, educ) | 0.3606 | -0.0130 |
-| Reverse Causality (re78 -> treat) | 0.1791 | -0.0054 |
-| False IV (age -> treat) | 0.1482 | -0.0057 |
+| Adjustment (re74, re75, age, educ) | 0.0009 | 0.0012 |
+| Reverse Causality (re78 -> treat) | 0.0008 | 0.0012 |
+| False IV (age -> treat) | 0.0008 | 0.0012 |
