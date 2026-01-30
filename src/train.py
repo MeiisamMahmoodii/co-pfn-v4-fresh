@@ -132,15 +132,16 @@ def train():
     steps_per_epoch = 100
     lambda_ate = 1.0
     lambda_trust = 5.0  # BCE loss weight
-    lambda_pairwise = 3.0  # Pairwise ranking loss weight - reduced to prevent trust equalization
+    lambda_pairwise = 2.0  # Pairwise ranking loss weight - lowered to allow correlation loss to breathe
     alpha_trust_weight = 0.5  # Trust-weighted ATE loss: weight = 1 + alpha * mean_trust
-    lambda_correlation = 0.3  # Trust-ATE correlation loss weight
+    lambda_correlation = 0.5  # Trust-ATE correlation loss weight - increased for stronger alignment
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"--- ADVERSARIAL TRAINING WITH PAIRWISE RANKING + TRUST-WEIGHTED ATE + CORRELATION LOSS ---")
+    print(f"--- ADVERSARIAL TRAINING WITH PAIRWISE RANKING + TRUST-WEIGHTED ATE + CORRELATION LOSS (FIX #5) ---")
     print(f"Device: {device} | Max Epochs: {n_epochs}")
     print(f"Weights: ATE={lambda_ate}, Trust={lambda_trust}, Pairwise={lambda_pairwise}, Correlation={lambda_correlation}")
     print(f"Trust-Weighted ATE: alpha={alpha_trust_weight}, weight range [1.0, 1.5]")
+    print(f"Goal: Increase correlation loss to force alignment between trust and ATE quality")
 
     # 2. Data & Model
     dataset = CausalPFNDataset(
