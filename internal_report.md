@@ -369,22 +369,76 @@ self.correction_head = nn.Sequential(
 
 ---
 
-## 11. Future Directions: Re-Aligning Trust
+## 11. Results of Phase 4 & 5: Calibration Experiments
 
-### Core Problem
-**Trust and ATE are no longer aligned.** High trust no longer guarantees a better ATE estimate.
+Following the "Decoupling" observed in Phase 3, we attempted to re-align Trust and ATE by discouraging the model from being confident about wrong estimates ("Fix #5").
 
-### The New Plan: Fix #4 (Restoring Feedback)
-**Goal:** Keep the efficiency gains of the MLP head but restore the utility-alignment of the trust score.
+### 11.1 Experiment Configuration
+*   **Fix #4 (Baseline for this section):** Soft gradient scaling (results were promising but volatile).
+*   **Fix #5 (Strong Constraints):** We introduced a heavy **Correlation Penalty** ($\lambda_{corr}=0.5$) to force $Trust \propto 1/Error$, while reducing the pair-wise ranking protection ($\lambda_{pair} = 3.0 \to 2.0$).
 
-**Action Items:**
-1.  **Re-Introduce ATE Gradient (Softly):** Instead of a full detach, use a scaled gradient or a "Utility Loss" auxiliary term.
-2.  **Calibration Regularization:** Explicitly penalize the model if High Trust samples have High ATE Error.
-3.  **Curriculum Training:** Train the Trust Head first (Frozen ATE), then the Correction Head (Frozen Trust), then Fine-tune both.
+### 11.2 Key Findings: The Collapse
+
+| Metric | Fix #4 | Fix #5 | Change | Status |
+| :--- | :--- | :--- | :--- | :--- |
+| **Corruption Gap @0%** | 0.4044 | **0.3748** | -7.3% | ⚠️ Worse |
+| **Corruption Gap @50%** | 0.5612 | **0.6003** | +6.9% | ✅ Better |
+| **Garbage Delta** | 0.3279 | **0.3354** | +2.3% | ✅ Maintained |
+| **Calibration Error** | 0.1691 | **0.1935** | +1.4% | ⚠️ Worse |
+| **ATE [0.4-0.7)** | 0.5561 | **0.5517** | -0.8% | ✅ Neutral |
+| **ATE [0.7-1.0)** | 0.9035 | **0.9026** | -0.1% | ⚠️ **Still Worst (Inverted)** |
+| **Correction Mag.** | 0.0057 | **0.0142** | +149% | 🎯 Active |
+| **Data Efficiency** | 6.24% | **2.18%** | -3.1x | 🔴 **COLLAPSED** |
+
+### 11.3 Analysis of Failure
+
+**Critical Issues:**
+*   🔴 **Data Efficiency Collapsed:** The efficiency gains we fought for in Phase 3/4 (reaching ~6%) were destroyed (back down to ~2%).
+*   ⚠️ **Inverted Relationship Persists:** High trust ($[0.7, 1.0)$) still corresponds to the *worst* ATE error (0.9026). The correlation loss failed to fix the fundamental alignment.
+*   ⚠️ **Calibration Degraded:** Moved further away from the target (<0.10).
+
+**Root Cause:**
+*   **Constraint Conflict:** The correlation loss ($\lambda=0.5$) was too aggressive. The model found it easier to *lower all trust scores* to avoid the penalty rather than actually fixing the ATE estimate.
+*   **Loss Imbalance:** Reducing the pairwise weight ($\lambda_{pair} \to 2.0$) allowed the model to sacrifice discrimination power to satisfy the correlation constraint.
+*   **Result:** A model that is "safe" (low correction, consistent trust) but useless (no efficiency gain).
 
 ---
 
-## 12. Alternative Architectural Options (Beyond Fix #4)
+## 12. Phase 6 Implementation: Soft Alignment (Fix #7)
+
+Based on the failure of Phase 5, we have updated the codebase ("Fix #7") to implement the **Soft Alignment** strategy. The goal is to nudge the model towards utility without crushing its discrimination capabilities.
+
+### 12.1 Key Adjustments
+We have deployed the following changes in `train.py`:
+
+1.  **Weak Correlation Penalty ($\lambda_{corr} = 0.5 \to 0.05$):**
+    We reduced the correlation weight by 10x. This changes the signal from a "Hard Constraint" to a "Gentle Nudge," allowing the model to tolerate some noise while gradually aligning trust with error ranks.
+
+2.  **Reinforced Discrimination ($\lambda_{pair} = 2.0 \to 4.0$):**
+    We doubled the pairwise ranking weight. This acts as a "Guardrail," ensuring that even if the model tries to optimize correlation, it is strictly forbidden from flipping the trust order (True < False).
+
+3.  **Soft Gradient Re-attachment:**
+    Instead of a full detach (Phase 3), we re-attached the trust weights to the ATE loss but clamped their influence.
+    ```python
+    # trust_weighted_ate = (1 + alpha * trust) * ate_loss
+    # Gradients flow back to trust, but scaled down
+    weight = (1.0 + 0.3 * mean_trust).clamp(1.0, 1.4)
+    ```
+
+### 12.2 New Correlation Loss Function
+We implemented a differentiable Spearman-like correlation loss on ranks to directly optimize the alignment.
+
+```python
+# src/train.py
+def trust_ate_correlation_loss(trust, ate_pred, ate_truth):
+    # ... rank computation ...
+    cov = (trust_ranks_norm * error_ranks_norm).mean()
+    corr = cov / (std_trust * std_error)
+    # Penalize if correlation is positive (High Trust -> High Error)
+    return F.relu(corr)
+```
+
+## 13. Alternative Architectural Options (Beyond Fix #7)
 
 ### Option A: MLP on Trust Head (Non-Linear Judge)
 

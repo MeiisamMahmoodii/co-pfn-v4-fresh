@@ -56,7 +56,31 @@ class SCMGenerator:
 
     def sample_observational_data(self, adj: torch.Tensor, n_samples: int, perm: np.ndarray, intervention: Optional[Dict[int, float]] = None) -> torch.Tensor:
         data = torch.zeros(n_samples, self.n_vars).to(self.device)
-        noise = torch.randn(n_samples, self.n_vars).to(self.device)
+        noise = torch.zeros(n_samples, self.n_vars).to(self.device)
+        
+        # DISTRIBUTIONAL ROBUSTNESS: Sample noise from diverse distributions per variable
+        # This prevents the model from overfitting to Gaussian assumptions (solving Lalonde OOD)
+        for i in range(self.n_vars):
+            dist_type = np.random.choice(['gauss', 'uniform', 'exp', 'gamma', 'beta'])
+            
+            if dist_type == 'gauss':
+                noise[:, i] = torch.randn(n_samples)
+            elif dist_type == 'uniform':
+                # Uniform[-sqrt(3), sqrt(3)] has std=1, mean=0
+                noise[:, i] = (torch.rand(n_samples) - 0.5) * 3.46 
+            elif dist_type == 'exp':
+                # Exp(1) has mean=1, std=1. Shift to mean=0.
+                noise[:, i] = torch.empty(n_samples).exponential_(1.0) - 1.0
+            elif dist_type == 'gamma':
+                # Gamma(2.0, 2.0) has mean=1, std=0.7. Normalize to mean=0, std=1
+                g = torch.distributions.Gamma(2.0, 2.0).sample((n_samples,))
+                noise[:, i] = (g - 1.0) * 1.41
+            elif dist_type == 'beta':
+                # Beta(0.5, 0.5) is bimodal (Archives). Mean=0.5, Var=0.125 -> Std=0.35.
+                b = torch.distributions.Beta(0.5, 0.5).sample((n_samples,))
+                noise[:, i] = (b - 0.5) * 2.82
+        
+        noise = noise.to(self.device)
         
         for base_idx in range(self.n_vars):
             actual_idx = perm[base_idx]

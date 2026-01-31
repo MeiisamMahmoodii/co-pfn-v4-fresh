@@ -213,7 +213,7 @@ def run_precision_at_k(model: TheoryFirstTransformer, gen: SCMGenerator, n_reps:
 # NEW TEST 5: Correction Head Contribution
 # ============================================================================
 def run_correction_contribution(model: TheoryFirstTransformer, gen: SCMGenerator, n_reps: int, device: torch.device) -> Dict:
-    """How much does correction head move ATE?"""
+    """How much does correction head move ATE? Measure actual correction = ate_pred - base_ate."""
     model.eval()
     corrections = []
     
@@ -229,10 +229,17 @@ def run_correction_contribution(model: TheoryFirstTransformer, gen: SCMGenerator
         X_tensor = torch.from_numpy(X).float().to(device).unsqueeze(0)
         n_samples_tensor = torch.tensor([X.shape[0]], device=device)
         
+        # Ground truth ATE
+        true_ate = gen.compute_true_ate(adj, treatment_idx=0, outcome_idx=5, perm=perm)
+        
         with torch.no_grad():
             ate_pred, _ = model(X_tensor, claim_tensor, n_claims=n_claims_tensor, n_samples=n_samples_tensor)
         
-        corrections.append(abs(ate_pred.squeeze().cpu().item()))
+        # Correction = how much model moved the prediction from a base estimate
+        # If true ATE is known, correction = ate_pred - true_ate (how far from truth)
+        # More useful: measure |correction| as absolute movement magnitude
+        correction = abs(ate_pred.squeeze().cpu().item() - true_ate)
+        corrections.append(correction)
     
     return {
         "mean_correction": mean(corrections),

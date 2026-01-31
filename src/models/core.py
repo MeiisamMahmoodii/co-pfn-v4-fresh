@@ -42,9 +42,13 @@ class TheoryFirstTransformer(nn.Module):
         # 2. Theory Auditor (Processes claims)
         self.theory_transformer = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(d_model=embed_dim, nhead=n_heads, batch_first=True, dropout=0.1),
-            num_layers=2
+            num_layers=6
         )
-        self.trust_head = nn.Linear(embed_dim, 1)
+        self.trust_head = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim // 2),
+            nn.GELU(),
+            nn.Linear(embed_dim // 2, 1)
+        )
 
         # 3. Cross-Attention: Claims (Q) query Data (K/V)
         # This force-feeds evidence into the theory
@@ -62,7 +66,7 @@ class TheoryFirstTransformer(nn.Module):
         # 5. Learnable trust amplification scale
         self.trust_scale = nn.Parameter(torch.tensor(2.0))
 
-    def forward(self, data: torch.Tensor, claims: torch.Tensor, n_claims: Optional[torch.Tensor] = None, n_samples: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, data: torch.Tensor, claims: torch.Tensor, n_claims: Optional[torch.Tensor] = None, n_samples: Optional[torch.Tensor] = None, trust_override: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_size = data.shape[0]
         max_samples = data.shape[1]
         k_claims = claims.shape[1]
@@ -143,7 +147,14 @@ class TheoryFirstTransformer(nn.Module):
         # Prediction must rely solely on the evidence extracted from data.
         theory_full_context = self.norm_cross(theory_evidence)
         
-        gated_theory = theory_full_context * trust_amplified
+        if trust_override is not None:
+            # TEACHER FORCING: Use the provided override (ground truth)
+            # This forces the Correction Head to learn from valid claims even if the Trust Head is unsure.
+            gated_theory = theory_full_context * trust_override
+        else:
+            # NORMAL: Use the model's own trust (detached to prevent cheating)
+            gated_theory = theory_full_context * trust_amplified.detach()
+        
         theory_contribution = self.correction_head(gated_theory.sum(dim=1)) # [B, 1]
 
         # Final ATE

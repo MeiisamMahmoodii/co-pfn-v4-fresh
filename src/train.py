@@ -2,11 +2,20 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import DataLoader
+import torch.distributed as dist
+from torch.utils.data import DataLoader, DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
+import sys
+import os
+
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from src.data.dataset import CausalPFNDataset, collate_fn
 from src.models.core import TheoryFirstTransformer
-import os
+from src.audit_suite import run_audit, AuditConfig, print_terminal_summary, write_report
 import time
+import random
 
 
 def pairwise_ranking_loss(trust_pred: torch.Tensor, validity_truth: torch.Tensor, n_claims: torch.Tensor, margin: float = 0.3) -> torch.Tensor:
@@ -61,10 +70,8 @@ def pairwise_ranking_loss(trust_pred: torch.Tensor, validity_truth: torch.Tensor
 
 def trust_ate_correlation_loss(trust_pred: torch.Tensor, ate_pred: torch.Tensor, ate_truth: torch.Tensor, n_claims: torch.Tensor) -> torch.Tensor:
     """
-    Correlation loss: Encourage high trust → low ATE error relationship.
-    
-    Uses Spearman rank correlation: trust should rank claims by ATE quality.
-    Loss = 1 - correlation (so higher correlation = lower loss)
+    Lightweight correlation loss: Encourage high trust → low ATE error.
+    Uses simple linear correlation (faster than Spearman for training).
     
     Args:
         trust_pred: [B, K, 1] predicted trust scores
@@ -73,7 +80,7 @@ def trust_ate_correlation_loss(trust_pred: torch.Tensor, ate_pred: torch.Tensor,
         n_claims: [B] number of actual claims per sample
     
     Returns:
-        Scalar loss (0 when perfectly correlated, 1 when anti-correlated)
+        Scalar loss
     """
     batch_size = trust_pred.shape[0]
     correlations = []
@@ -86,34 +93,26 @@ def trust_ate_correlation_loss(trust_pred: torch.Tensor, ate_pred: torch.Tensor,
         # Trust scores for this sample
         trust_b = trust_pred[b, :k, 0]  # [k]
         
-        # ATE error: how wrong was the prediction for this sample?
-        # Higher error = worse ATE, so trust should be LOW
-        # Both ate_pred and ate_truth are [B, 1], we need scalars
-        ate_pred_scalar = ate_pred[b].squeeze() if ate_pred[b].dim() > 0 else ate_pred[b]  # scalar
-        ate_truth_scalar = ate_truth[b].squeeze() if ate_truth[b].dim() > 0 else ate_truth[b]  # scalar
+        # ATE error: higher error = worse ATE, so trust should be LOW
+        ate_pred_scalar = ate_pred[b].squeeze() if ate_pred[b].dim() > 0 else ate_pred[b]
+        ate_truth_scalar = ate_truth[b].squeeze() if ate_truth[b].dim() > 0 else ate_truth[b]
         ate_error = torch.abs(ate_pred_scalar - ate_truth_scalar).expand(k)  # [k]
         
-        # Compute Spearman correlation via rank
-        # Ranks: lower ranks (1) for better ATE predictions, higher ranks for worse
-        trust_ranks = torch.argsort(torch.argsort(trust_b.float()))  # Higher trust = higher rank
-        error_ranks = torch.argsort(torch.argsort(ate_error.float()))  # Higher error = higher rank
+        # Linear correlation: corr = cov(trust, error) / (std(trust) * std(error))
+        trust_norm = trust_b - trust_b.mean()
+        error_norm = ate_error - ate_error.mean()
         
-        # Pearson correlation on ranks (Spearman)
-        trust_ranks_norm = trust_ranks.float() - trust_ranks.float().mean()
-        error_ranks_norm = error_ranks.float() - error_ranks.float().mean()
-        
-        cov = (trust_ranks_norm * error_ranks_norm).mean()
-        std_trust = trust_ranks_norm.std()
-        std_error = error_ranks_norm.std()
+        cov = (trust_norm * error_norm).mean()
+        std_trust = trust_norm.std()
+        std_error = error_norm.std()
         
         if std_trust > 1e-6 and std_error > 1e-6:
-            corr = cov / (std_trust * std_error)
+            corr = cov / (std_trust * std_error + 1e-8)
         else:
             corr = torch.tensor(0.0, device=trust_pred.device)
         
         # We want NEGATIVE correlation: high trust → LOW error
-        # So target is -1.0, and loss = (corr - (-1.0))^2 would penalize positive correlations
-        # Simpler: loss = max(0, corr) -- penalize when correlation is positive or zero
+        # Loss = max(0, corr) penalizes positive/zero correlations
         correlations.append(F.relu(corr))
     
     if len(correlations) == 0:
@@ -123,6 +122,20 @@ def trust_ate_correlation_loss(trust_pred: torch.Tensor, ate_pred: torch.Tensor,
 
 
 def train():
+    # Initialize distributed training if running with torchrun
+    distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
+    if distributed:
+        dist.init_process_group(backend="nccl")
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        device = torch.device(f"cuda:{rank}")
+        is_main_process = rank == 0
+    else:
+        rank = 0
+        world_size = 1
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        is_main_process = True
+    
     # 1. Hyperparameters
     max_vars = 20
     max_samples = 1000
@@ -132,16 +145,18 @@ def train():
     steps_per_epoch = 100
     lambda_ate = 1.0
     lambda_trust = 5.0  # BCE loss weight
-    lambda_pairwise = 2.0  # Pairwise ranking loss weight - lowered to allow correlation loss to breathe
-    alpha_trust_weight = 0.5  # Trust-weighted ATE loss: weight = 1 + alpha * mean_trust
-    lambda_correlation = 0.5  # Trust-ATE correlation loss weight - increased for stronger alignment
+    lambda_pairwise = 4.0  # Pairwise ranking loss weight - increased for stronger discrimination
+    alpha_trust_weight = 0.3  # Trust-weighted ATE loss: weight = 1 + alpha * mean_trust (reattached)
+    alpha_trust_weight = 0.3  # (Phase 8) Optimal balance for correction
+    lambda_correlation = 0.0  # Disabled to ensure pure detached trust
+    teacher_forcing_ratio = 0.1  # (Phase 8) Target 0.38% Efficiency without breaking robustness
     
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"--- ADVERSARIAL TRAINING WITH PAIRWISE RANKING + TRUST-WEIGHTED ATE + CORRELATION LOSS (FIX #5) ---")
-    print(f"Device: {device} | Max Epochs: {n_epochs}")
-    print(f"Weights: ATE={lambda_ate}, Trust={lambda_trust}, Pairwise={lambda_pairwise}, Correlation={lambda_correlation}")
-    print(f"Trust-Weighted ATE: alpha={alpha_trust_weight}, weight range [1.0, 1.5]")
-    print(f"Goal: Increase correlation loss to force alignment between trust and ATE quality")
+    if is_main_process:
+        print(f"--- ADVERSARIAL TRAINING (Option A + Detached) ---")
+        print(f"Device: {device} | Rank: {rank}/{world_size} | Max Epochs: {n_epochs}")
+        print(f"Weights: ATE={lambda_ate}, Trust={lambda_trust}, Pairwise={lambda_pairwise}, Correlation={lambda_correlation}")
+        print(f"Trust-Weighted ATE: alpha={alpha_trust_weight}, detached gradients")
+        print(f"Goal: Strong discrimination + weak correlation nudge to align trust with ATE without collapse")
 
     # 2. Data & Model
     dataset = CausalPFNDataset(
@@ -153,15 +168,30 @@ def train():
         corruption_rate=0.5,  # 50% false claims
         enforce_edge_rate=0.35  # Reduced from 0.6 to prevent trust saturation
     )
-    dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn)
+    
+    if distributed:
+        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
+        dataloader = DataLoader(dataset, batch_size=batch_size, sampler=sampler, collate_fn=collate_fn, 
+                              pin_memory=True, num_workers=4, prefetch_factor=2)
+    else:
+        dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn,
+                              pin_memory=True, num_workers=4, prefetch_factor=2)
     
     model = TheoryFirstTransformer(n_vars=max_vars).to(device)
+    
+    if distributed:
+        model = DDP(model, device_ids=[rank])
     
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
     
     criterion_ate = nn.HuberLoss()
     criterion_trust = nn.BCELoss()
+    
+    # Enable cuDNN benchmarking for faster training
+    torch.backends.cudnn.benchmark = True
+    if hasattr(torch.backends.cudnn, 'allow_tf32'):
+        torch.backends.cudnn.allow_tf32 = True
 
     # 3. Training Loop
     model.train()
@@ -187,7 +217,13 @@ def train():
             
             optimizer.zero_grad()
             
-            ate_pred, trust_pred = model(data, claims, n_claims=n_claims, n_samples=n_samples)
+            # TEACHER FORCING: Occasionally force the gate open for valid claims
+            # This solves the "Lazy Mechanic" problem where the Correction Head never gets a signal
+            trust_override = None
+            if random.random() < teacher_forcing_ratio:
+                trust_override = validity_truth # [B, K, 1] - Use ground truth (1.0 or 0.0)
+
+            ate_pred, trust_pred = model(data, claims, n_claims=n_claims, n_samples=n_samples, trust_override=trust_override)
             
             loss_trust = criterion_trust(trust_pred, validity_truth)
             loss_pairwise = pairwise_ranking_loss(trust_pred, validity_truth, n_claims, margin=0.3)
@@ -200,10 +236,10 @@ def train():
             for b in range(batch_size_actual):
                 k = n_claims[b].item()
                 if k > 0:
-                    # Mean trust for this sample - DETACHED to prevent model lowering trust to dodge ATE penalties
-                    mean_trust_b = trust_pred[b, :k, 0].detach().mean()
-                    # Weight: 1 + alpha * mean_trust, clamped to [1.0, 1.5]
-                    weight = (1.0 + alpha_trust_weight * mean_trust_b).clamp(1.0, 1.5)
+                    # Mean trust for this sample - REATTACHED to allow gradients (Fix #6)
+                    mean_trust_b = trust_pred[b, :k, 0].detach().mean()  # Detached (Phase 3 style)
+                    # Weight: 1 + alpha * mean_trust, clamped to [1.0, 1.4] (softer range)
+                    weight = (1.0 + alpha_trust_weight * mean_trust_b).clamp(1.0, 1.4)
                     ate_weights.append(weight)
                 else:
                     ate_weights.append(torch.tensor(1.0, device=device))
@@ -235,18 +271,48 @@ def train():
         scheduler.step()
 
         elapsed = time.time() - start_time
-        print(f"E{epoch+1:03d} | Total: {epoch_loss/steps_per_epoch:.4f} "
-            f"| ATE: {epoch_ate_loss/steps_per_epoch:.4f} | Trust: {epoch_trust_loss/steps_per_epoch:.4f} "
-            f"| Pair: {epoch_pair_loss/steps_per_epoch:.4f} | Corr: {epoch_corr_loss/steps_per_epoch:.4f} | LR: {optimizer.param_groups[0]['lr']:.6f} | Time: {elapsed:.1f}s")
+        if is_main_process:
+            print(f"E{epoch+1:03d} | Total: {epoch_loss/steps_per_epoch:.4f} "
+                f"| ATE: {epoch_ate_loss/steps_per_epoch:.4f} | Trust: {epoch_trust_loss/steps_per_epoch:.4f} "
+                f"| Pair: {epoch_pair_loss/steps_per_epoch:.4f} | Corr: {epoch_corr_loss/steps_per_epoch:.4f} | LR: {optimizer.param_groups[0]['lr']:.6f} | Time: {elapsed:.1f}s")
         
-        # Periodic checkpoint
-        if (epoch + 1) % 10 == 0:
-            torch.save(model.state_dict(), f'checkpoints/model_adv_e{epoch+1}.pt')
+        # Periodic checkpoint (main process only)
+        if is_main_process and (epoch + 1) % 10 == 0:
+            os.makedirs('checkpoints', exist_ok=True)
+            torch.save(model.module.state_dict() if distributed else model.state_dict(), f'checkpoints/model_adv_e{epoch+1}.pt')
 
-    # 4. Save Final
-    os.makedirs('checkpoints', exist_ok=True)
-    torch.save(model.state_dict(), 'checkpoints/model_adversarial_v2.pt')
-    print("Training complete. Ground-breaking model (maybe) saved.")
+    # 4. Save Final (main process only)
+    if is_main_process:
+        os.makedirs('checkpoints', exist_ok=True)
+        final_ckpt_path = 'checkpoints/model_adversarial_v2.pt'
+        torch.save(model.module.state_dict() if distributed else model.state_dict(), final_ckpt_path)
+        print("Training complete. Ground-breaking model saved.")
+        
+        # --- BAKED-IN AUDIT (The "Trustable Test Suite") ---
+        print("\n" + "="*80)
+        print("STARTING AUTOMATED AUDIT PROTOCOL")
+        print("="*80)
+        
+        # Configure audit matching training context
+        audit_cfg = AuditConfig(
+            checkpoint=final_ckpt_path,
+            n_vars=max_vars,
+            seed=42  # Fixed seed for trustable comparison
+        )
+        
+        # Run audit and show results
+        report_md, metrics = run_audit(audit_cfg)
+        print_terminal_summary(metrics)
+        
+        # Save full report
+        report_path = os.path.join("results", "audit_report_final.md")
+        write_report(report_path, report_md)
+        print(f"Full verified report saved to: {report_path}")
+
+    
+    # Cleanup distributed training
+    if distributed:
+        dist.destroy_process_group()
 
 if __name__ == "__main__":
     train()

@@ -367,6 +367,18 @@ def run_index_sorting_check(gen: SCMGenerator, cfg: AuditConfig) -> Dict[str, fl
         "pct_src_lt_tgt": 100.0 * forward / total if total else 0.0,
         "pct_src_gt_tgt": 100.0 * reverse / total if total else 0.0,
     }
+    return {
+        "efficiency": efficiency,
+        "corruption": corruption,
+        "scale": scale,
+        "kernels": kernels,
+        "best_worst": best_worst,
+        "garbage": garbage,
+        "stability": stability,
+        "index_sorting": index_sorting,
+        "lalonde": lalonde,
+        "elapsed": elapsed
+    }
 
 
 def write_report(path: str, content: str) -> None:
@@ -375,29 +387,20 @@ def write_report(path: str, content: str) -> None:
         f.write(content)
 
 
-def run_audit(cfg: AuditConfig) -> str:
-    set_seed(cfg.seed)
+def generate_report_md(cfg: AuditConfig, metrics: Dict) -> str:
+    elapsed = metrics["elapsed"]
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = TheoryFirstTransformer(n_vars=cfg.n_vars).to(device)
-    model.load_state_dict(torch.load(cfg.checkpoint, map_location=device))
-    model.eval()
-
-    gen = SCMGenerator(n_vars=cfg.n_vars, device=device.type)
-
-    started = time.time()
-
-    efficiency = run_efficiency_sweep(model, gen, cfg, device)
-    corruption = run_corruption_sweep(model, gen, cfg, device)
-    scale = run_scale_sweep(model, cfg, device)
-    kernels = run_kernel_breakdown(model, cfg, device)
-    best_worst = run_best_worst_case(model, cfg, device)
-    garbage = run_garbage_audit(model, gen, cfg, device)
-    stability = run_stability_test(model, cfg, device)
-    index_sorting = run_index_sorting_check(gen, cfg)
-    lalonde = run_lalonde_audit(cfg.checkpoint, 'data/raw/lalonde.csv', n_vars=cfg.n_vars, max_claims=cfg.max_claims)
-
-    elapsed = time.time() - started
-
+    
+    efficiency = metrics["efficiency"]
+    corruption = metrics["corruption"]
+    scale = metrics["scale"]
+    kernels = metrics["kernels"]
+    best_worst = metrics["best_worst"]
+    garbage = metrics["garbage"]
+    stability = metrics["stability"]
+    index_sorting = metrics["index_sorting"]
+    lalonde = metrics["lalonde"]
+    
     md = []
     md.append("# Co-PFN Audit Report")
     md.append("")
@@ -539,6 +542,79 @@ def run_audit(cfg: AuditConfig) -> str:
     return "\n".join(md) + "\n"
 
 
+def print_terminal_summary(metrics: Dict) -> None:
+    print("\n" + "="*80)
+    print("FINAL AUDIT SUMMARY (TRUST & ROBUSTNESS)")
+    print("="*80)
+    
+    # Extract Key Metrics
+    eff_gain_100 = metrics["efficiency"][100]["eff_gain_pct"]
+    
+    # Corruption Gaps
+    corr_gap_0 = next(r["gap"] for r in metrics["corruption"] if r["rate"] == 0.0)
+    corr_gap_50 = next(r["gap"] for r in metrics["corruption"] if r["rate"] == 0.5)
+    
+    # Garbage
+    garbage_delta = metrics["garbage"]["delta"]
+    
+    # Lalonde (Mean trust for adjusted vs unadjusted/bad claims)
+    # We don't have labeled Lalonde in metrics easily, just list. 
+    # But usually first claim is the valid adjustment.
+    lalonde_trust = metrics["lalonde"][0]["trust"] if metrics["lalonde"] else 0.0
+    
+    print(f"{'Metric':<30} | {'Value':<10} | {'Status':<15}")
+    print("-" * 60)
+    
+    # Efficiency
+    status = "✅ PASS" if eff_gain_100 > 0.5 else "❌ FAIL"
+    print(f"{'Efficiency Gain (N=100)':<30} | {eff_gain_100:>9.2f}% | {status}")
+    
+    # Corruption
+    status = "✅ PASS" if corr_gap_0 > 0.3 else "⚠️ LOW"
+    print(f"{'Corruption Gap @ 0%':<30} | {corr_gap_0:>10.4f} | {status}")
+    
+    status = "✅ PASS" if corr_gap_50 > 0.4 else "⚠️ LOW"
+    print(f"{'Corruption Gap @ 50%':<30} | {corr_gap_50:>10.4f} | {status}")
+    
+    # Garbage
+    status = "✅ PASS" if garbage_delta > 0.25 else "❌ FAIL"
+    print(f"{'Garbage Delta':<30} | {garbage_delta:>10.4f} | {status}")
+    
+    # Lalonde
+    status = "✅ PASS" if lalonde_trust > 0.1 else "⚠️ LOW"
+    print(f"{'Lalonde Trust (Adjust)':<30} | {lalonde_trust:>10.4f} | {status}")
+    
+    print("="*80 + "\n")
+
+
+def run_audit(cfg: AuditConfig) -> Tuple[str, Dict]:
+    set_seed(cfg.seed)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = TheoryFirstTransformer(n_vars=cfg.n_vars).to(device)
+    model.load_state_dict(torch.load(cfg.checkpoint, map_location=device))
+    model.eval()
+
+    gen = SCMGenerator(n_vars=cfg.n_vars, device=device.type)
+
+    started = time.time()
+
+    metrics = {
+        "efficiency": run_efficiency_sweep(model, gen, cfg, device),
+        "corruption": run_corruption_sweep(model, gen, cfg, device),
+        "scale": run_scale_sweep(model, cfg, device),
+        "kernels": run_kernel_breakdown(model, cfg, device),
+        "best_worst": run_best_worst_case(model, cfg, device),
+        "garbage": run_garbage_audit(model, gen, cfg, device),
+        "stability": run_stability_test(model, cfg, device),
+        "index_sorting": run_index_sorting_check(gen, cfg),
+        "lalonde": run_lalonde_audit(cfg.checkpoint, 'data/raw/lalonde.csv', n_vars=cfg.n_vars, max_claims=cfg.max_claims),
+    }
+    metrics["elapsed"] = time.time() - started
+    
+    report_md = generate_report_md(cfg, metrics)
+    return report_md, metrics
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", default="checkpoints/model_adversarial_v2.pt")
@@ -555,7 +631,10 @@ def main() -> None:
         cfg.best_worst_reps = 3
         cfg.garbage_reps = 5
 
-    report = run_audit(cfg)
+        cfg.garbage_reps = 5
+
+    report, metrics = run_audit(cfg)
+    print_terminal_summary(metrics)
     report_path = os.path.join("results", "audit_report.md")
     write_report(report_path, report)
     print(f"Audit report written to {report_path}")
